@@ -1,0 +1,399 @@
+---
+title: "HW3-508"
+author: "YEBEI YAO"
+date: "11/30/2021"
+output:
+  html_document:
+    highlight: zenburn
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+**01.Introduction**
+========================================
+## 1.1 Goal
+
+## 1.2 set up
+To start up, I loaded the necessary library and functions for further analysis, as well as standardized format and color of maps and plots,and reload the cross validation function.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+
+library(tidyverse)
+library(sf)
+#install.packages('RSocrata')
+library(RSocrata)
+library(viridis)
+library(spatstat)
+library(raster)
+library(spdep)
+library(FNN)
+library(grid)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(tidycensus)
+library(tidyr)
+library(dplyr)
+library(magrittr)
+library(mapview)
+library(caret)
+library(ckanr) 
+library(ggcorrplot)
+library(jtools)     
+library(stargazer) 
+library(broom)
+library(tufte)
+library(rmarkdown)
+library(viridis)
+library(spatstat) 
+library(rgdal)
+
+
+# functions
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+```
+
+```{r setup,include=FALSE, cache = FALSE}
+
+remove(crossValidate)
+crossValidate <-  function(dataset, id, dependentVariable, indVariables) {
+  
+  allPredictions <- data.frame()
+  cvID_list <- unique(dataset[[id]])
+  
+  for (i in cvID_list) {
+    
+    thisFold <- i
+    #cat("This hold out fold is", thisFold, "\n")
+    
+    fold.train <- filter(dataset, dataset[[id]] != thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    fold.test  <- filter(dataset, dataset[[id]] == thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    
+    regression <-
+      glm(paste0(dependentVariable,"~."), family = "poisson", 
+          data = fold.train %>% 
+            dplyr::select(-geometry, -id))
+    
+    thisPrediction <- 
+      mutate(fold.test, Prediction = predict(regression, fold.test, type = "response"))
+    
+    allPredictions <-
+      rbind(allPredictions, thisPrediction)
+    
+  }
+  return(st_sf(allPredictions))
+}
+```
+
+**02.Data wrangling**
+========================================
+## 2.1 Read in Basic Data from Chicago
+I load the three kinds of dataset for analysis.
+First, the base map datasets./
+geometry data for both police districts and police beats,work as the neighborhood units in this project, and the boundary of Chicago.
+Second, I load and clean the criminal demage data in Chicago in 2018.
+```{r chicago, message = FALSE, warning = FALSE}
+#Chicago police districts
+policeDistricts <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/fthy-xz3r?method=export&format=GeoJSON") %>%
+  st_transform('ESRI:102271') %>%
+  dplyr::select(District = dist_num)
+  
+policeBeats <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/aerh-rz74?method=export&format=GeoJSON") %>%
+  st_transform('ESRI:102271') %>%
+  dplyr::select(District = beat_num)
+
+bothPoliceUnits <- rbind(mutate(policeDistricts, Legend = "Police Districts"), 
+                         mutate(policeBeats, Legend = "Police Beats"))
+
+#boundary
+chicagoBoundary <- 
+  st_read(file.path(root.dir,"/Chapter5/chicagoBoundary.geojson")) %>%
+  st_transform('ESRI:102271') 
+
+#Assaults
+
+assaults <- 
+  read.socrata("https://data.cityofchicago.org/Public-Safety/Crimes-2018/d62x-nvdr") %>% 
+    filter(Primary.Type == "ASSAULT" & Description != "SIMPLE") %>%
+    mutate(x = gsub("[()]", "", Location))
+
+assaults_clean<-assaults%>%
+    separate(x,into= c("Y","X"), sep=",") %>%
+    mutate(X = as.numeric(X),Y = as.numeric(Y)) %>% 
+    drop_na(X) %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant")%>%
+    st_transform('ESRI:102271') %>% 
+    distinct()
+```
+
+## 2.2 Visualizing Point Data
+From the mapping below, the assault incidents happened in Chicago in 2018 has spatial cluster in western and central area in the city, while the points shows relatively evenly plotting pattern around the city, the hotspot map shows clearly that crime is more clustered in two parts of city.
+```{r vis, fig.width=6, fig.height=4,message = FALSE, warning = FALSE}
+#Plotting point data and density
+
+grid.arrange(ncol=2,nrow=2,heights=(c(5,1)),widths=(c(1,1)),
+ggplot() + 
+  geom_sf(data = chicagoBoundary, fill = "transparent") +
+  geom_sf(data = assaults_clean, colour="#7a0177", size=0.5, show.legend = "point") +
+  labs(title= "Assaults Arrests, Chicago - 2018") +
+  mapTheme(title_size = 12),
+
+ggplot() + 
+  geom_sf(data = chicagoBoundary, fill = "transparent") +
+  stat_density2d(data = data.frame(st_coordinates(assaults_clean)), 
+                 aes(X, Y, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 40, geom = 'polygon') +
+  scale_fill_viridis(option = "plasma") +
+  scale_alpha(range = c(0.00, 0.35), guide = FALSE) +
+  labs(title = "Density of Assaults") +
+  mapTheme(title_size = 14) + theme(legend.position = "none"))
+
+```
+## 2.3 Creating a Fishnet Grid
+Since the assault cases happens smoothly across administrative units, it is more helpful to represent the spatial cluster and dispertion trend in a regression -ready form,to create the fishnet grid and to aggregate the point-level data into a lattice of grid cells.In this case, the fishnet is within cell units in 500m by 500m.
+```{r fishnet,message = FALSE, warning = FALSE}
+fishnet <- 
+  st_make_grid(chicagoBoundary,
+               cellsize = 500, 
+               square = TRUE) %>%
+  .[chicagoBoundary] %>%            # <- MDH Added
+  st_sf() %>%
+  mutate(uniqueID = rownames(.))
+
+mapview(fishnet)
+```
+
+## 2.4 Joining Criminal demage to the Fishnet
+Take the fishnet grid as basis, I can get the count of assaults in each grid cell,spatial join the count with the fishnet,then get the sum of count in each cell. The grid cell with no assaults recieved NA is converted to 0,The unique ID and CvID is created for assigning name for each grid cell and to allow the 100-fold cross validation conducted below.
+```{r joins,message = FALSE, warning = FALSE}
+assault_net <- 
+  dplyr::select(assaults_clean) %>% 
+  mutate(countassaults = 1) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(countassaults = replace_na(countassaults, 0),
+         uniqueID = rownames(.),
+         cvID = sample(round(nrow(fishnet) / 24), size=nrow(fishnet), replace = TRUE))
+
+ggplot() +
+  geom_sf(data = assault_net, aes(fill = countassaults)) +
+  scale_fill_viridis(option = "plasma") +
+  labs(title = "Count of assault for the fishnet",
+       caption = "Data resource: Chicago Opendata") +
+  mapTheme()
+```
+ 
+## 2.5 Wrangling Risk Factors/Spatial Features
+Next,I loaded the Risk Factors available on Chicago open data portal. 
+Besides five data from text book, which are abandoned cars, street lights out, graffiti remediation, sanitation complaints, and abandon buildings.
+I also selected other five data sets, which are pot holes,tree debris report and garbage carts,tobacco retail and liquor retail stores.
+While assault_net works to include the counts of assault in each cell, the risk factor features listed above are downloaded and wrangled to the fishnet.
+```{r riskfactor,message = FALSE, warning = FALSE}
+# original data from text book.
+abandonCars <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Abandoned-Vehicles/3c9v-pnva") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2018") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Abandoned_Cars")
+  
+abandonBuildings <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Vacant-and-Abandoned-Building/7nii-7srd") %>%
+    mutate(year = substr(date_service_request_was_received,1,4)) %>%  filter(year == "2018") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Abandoned_Buildings")
+
+graffiti <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Graffiti-Removal-Historical/hec5-y4x5") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2018") %>%
+    filter(where_is_the_graffiti_located_ %in% c("Front", "Rear", "Side")) %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Graffiti")
+
+streetLightsOut <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Street-Lights-All-Out/zuxi-7xem") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2018") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Street_Lights_Out")
+
+sanitation <-
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Sanitation-Code-Complaints-Hi/me59-5fac") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2018") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Sanitation")
+
+# selected new data from open data Chicago.
+#Pot holes
+pot_holes <- 
+  read.socrata("https://data.cityofchicago.org/resource/_311-potholes.json") %>%
+    mutate(year = substr(creation_date,1,4)) %>% 
+    filter(year == "2018") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Potholes")
+
+#Tree Debris report
+tree_debris <-
+  read.socrata("https://data.cityofchicago.org/resource/7y74-rf9i.json")%>%
+    mutate(year = substr(creation_date,1,4))%>%
+    filter(year=="2018")%>%
+  dplyr::select(Y = latitude, X = longitude)%>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Tree_debris")
+  
+# Garbage Carts Request 
+garbageCarts <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Garbage-Carts-Historical/9ksk-na4q") %>%
+    mutate(year = substr(creation_date,1,4)) %>% 
+    filter(year == "2018") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Garbage_Carts")
+
+#Tobacco Retail stores
+tobaccoRetail <- 
+  read.socrata("https://data.cityofchicago.org/Community-Economic-Development/Tobacco/98qj-ah7k") %>%
+  filter(BUSINESS.ACTIVITY == "Retail Sale of Tobacco") %>%
+  dplyr::select(Y = LATITUDE, X = LONGITUDE) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Tobacco_Retail")
+
+#Liquor Retail stores
+liquorRetail <- 
+  read.socrata("https://data.cityofchicago.org/Community-Economic-Development/Liquor-Retail/4py5-yxxu") %>%
+  filter(BUSINESS.ACTIVITY == "Retail Sales of Packaged Liquor") %>%
+  dplyr::select(Y = LATITUDE, X = LONGITUDE) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Liquor_Retail")
+
+
+#neighborhood
+neighborhoods <- 
+  st_read("https://raw.githubusercontent.com/blackmad/neighborhoods/master/chicago.geojson") %>%
+  st_transform(st_crs(fishnet)) 
+```
+**03.Feature engineering**
+========================================
+## 3.1 Count of risk factors by grid cell
+In order to measure the exposure to each risk reatures, I create the vars_net,to join the features with the fishnet and count each risk factor for every grid cell, and come up with a big dataframe with a column for each fishnet "uniqueID".
+```{r riskfactorcell,message = FALSE, warning = FALSE}
+vars_net <- 
+  rbind(abandonCars,abandonBuildings,graffiti,streetLightsOut,sanitation,
+       pot_holes,tree_debris,garbageCarts,tobaccoRetail,liquorRetail ) %>%
+  st_join(., fishnet, join=st_within) %>%
+  st_drop_geometry() %>%
+  group_by(uniqueID, Legend) %>%
+  summarize(count = n()) %>%
+    full_join(fishnet) %>%
+    spread(Legend, count, fill=0) %>%
+    st_sf() %>%
+    dplyr::select(-`<NA>`) %>%
+    na.omit() %>%
+    ungroup()
+
+# transfer data into long format
+vars_net.long <- 
+  gather(vars_net, Variable, value, -geometry, -uniqueID)
+
+# plot maps for each feature
+vars <- unique(vars_net.long$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(vars_net.long, Variable == i), aes(fill=value), colour=NA) +
+      scale_fill_viridis(option = "plasma",name="") +
+      labs(title=i) +
+      mapTheme()}
+
+do.call(grid.arrange,c(mapList, ncol=3, top="Risk Factors by Fishnet"))
+```
+## 3.2 Nearest neighbor features
+Since the grid cell impose a very rigid spatial scale of exposure, I added the second approach, to calculate average nearest neighbor distance to hypothesize a smoother exposure relationship across space.
+
+```{r nnneighbor,message = FALSE, warning = FALSE}
+# convinience to reduce length of function names.
+st_c    <- st_coordinates
+st_coid <- st_centroid
+
+
+## create NN from abandoned cars
+vars_net <- vars_net %>%
+    mutate(
+      abandon_Buildings.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(abandonBuildings),3),
+      graffiti.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(graffiti),3),
+      streetLightsOut.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(streetLightsOut),3),
+      sanitation.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(sanitation),3),
+      abandonCars.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(abandonCars),3),
+      tree_debris.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(tree_debris),3),
+      garbageCarts.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(garbageCarts),3),
+      tobaccoRetail.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(tobaccoRetail),3),
+       pot_holes.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(pot_holes),3),
+      liquorRetail.nn =
+        nn_function(st_c(st_coid(vars_net)), st_c(liquorRetail),3))
+
+
+
+vars_net.long.nn <- 
+  dplyr::select(vars_net, ends_with(".nn")) %>%
+    gather(Variable, value, -geometry)
+
+vars <- unique(vars_net.long.nn$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(vars_net.long.nn, Variable == i), aes(fill=value), colour=NA) +
+      scale_fill_viridis(option = "plasma",name="") +
+      labs(title=i) +
+      mapTheme()}
+
+do.call(grid.arrange,c(mapList, ncol = 3, top = "Nearest Neighbor risk Factors by Fishnet"))
+```
+
+
+
+
+
+
